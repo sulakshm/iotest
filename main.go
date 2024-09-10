@@ -54,6 +54,7 @@ var (
 	seed        = flag.Int("seed", 0, "data pattern seeding")
 	devicesFile = flag.String("targets", "", "load target devices from given file")
 	shuffle     = flag.Bool("shuffle", false, "shuffle data color and rebuild targets")
+	random      = flag.Bool("random", false, "generate random offsets every iteration")
 
 	journalFilePath = "/var/cores/lns/j.dat"
 
@@ -446,9 +447,15 @@ func main() {
 		}
 		wg.Wait()
 
-		byteOff += (4096 * int64(p.q))
-		if uint64(byteOff) >= p.size {
-			byteOff = 0
+		if *random {
+			// can overwrite
+			byteOff = rand.Int63n(nIterations) * 4096 * int64(p.q)
+		} else {
+			// sequential qdepth * 4k range covered
+			byteOff += (4096 * int64(p.q))
+			if uint64(byteOff) >= p.size {
+				byteOff = 0
+			}
 		}
 	}
 

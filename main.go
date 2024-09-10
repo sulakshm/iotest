@@ -37,6 +37,7 @@ const (
 	testDev    = "/dev/mapper/pwx0-507637469268482126"
 	dataInPath = "/var/cores/lns/in"
 	NBUFS      = 16
+	MAXCOLORS  = 16
 )
 
 var (
@@ -48,14 +49,15 @@ var (
 	jlock sync.Mutex
 
 	// flags
-	verify = flag.Bool("verify", false, "Enable verify mode")
-	dev    = flag.String("dev", testDev, "test device")
-	seed   = flag.Int("seed", 0, "data pattern seeding")
+	verify      = flag.Bool("verify", false, "Enable verify mode")
+	dev         = flag.String("dev", testDev, "test device")
+	seed        = flag.Int("seed", 0, "data pattern seeding")
 	devicesFile = flag.String("targets", "", "load target devices from given file")
+	shuffle     = flag.Bool("shuffle", false, "shuffle data color and rebuild targets")
 
 	journalFilePath = "/var/cores/lns/j.dat"
 
-	gTargets    = map[string]targetInfo{}
+	gTargets = map[string]targetInfo{}
 )
 
 func appExit(err error) {
@@ -338,6 +340,56 @@ func clearTargets() {
 	}
 }
 
+func do_shuffle() {
+	gTargets = make(map[string]targetInfo)
+
+	if *devicesFile == "" {
+		fmt.Printf("shuffle data color only when targets file is available - no work")
+		return
+	}
+
+	// dev path color(0-15)
+	// 1124864597118850913 /dev/mapper/pwx0-1124864597118850913 2
+	targets, err := os.Open(*devicesFile)
+	if err != nil {
+		appExit(err)
+	}
+
+	scanner := bufio.NewScanner(targets)
+
+	var dev string
+	var path string
+	var color int
+	for scanner.Scan() {
+		n, err := fmt.Sscanf(scanner.Text(), "%s %s %d", &dev, &path, &color)
+		if err != nil {
+			appExit(fmt.Errorf("parse failure %s, err %v", scanner.Text(), err))
+		}
+		if n != 3 {
+			appExit(fmt.Errorf("incomplete targets %s - quitting\n", scanner.Text()))
+		}
+
+		fmt.Printf("target %s, path %s, color %d\n", dev, path, color)
+
+		if color > 15 || color < 0 {
+			color = *seed // write default if out of bounds
+		} else {
+			color = rand.Intn(MAXCOLORS)
+		}
+		gTargets[dev] = targetInfo{path: path, color: color}
+	}
+	targets.Close()
+
+	outb := make([]byte, 4096)
+	for tag, ti := range gTargets {
+		// write tag, ti.path ti.color
+		outb = append(outb, []byte(fmt.Sprintf("%s %s %d\n", tag, ti.path, ti.color))...)
+	}
+	if err := os.WriteFile(*devicesFile, outb, 0644); err != nil {
+		appExit(err)
+	}
+}
+
 func main() {
 	var err error
 
@@ -345,6 +397,11 @@ func main() {
 	if *seed > 15 || *seed < 0 {
 		fmt.Printf("seed(%d) out of bounds, reset to 0\n", *seed)
 		*seed = 0
+	}
+
+	if *shuffle {
+		do_shuffle()
+		os.Exit(0)
 	}
 
 	loadTargets()

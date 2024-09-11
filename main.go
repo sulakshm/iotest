@@ -280,12 +280,20 @@ func loadTargets() {
 	if *devicesFile == "" {
 		// load defaults
 		path := *dev
+		mode := unix.O_RDWR | unix.O_DIRECT
 		if fi, err := os.Stat(path); err != nil {
 			appExit(err)
 		} else if fi.Mode()&fs.ModeDevice == 0 {
-			appExit(fmt.Errorf("bad block device %s", path))
+			fmt.Printf("%s is not a block device\n", path)
+			if !*verify {
+				mode = unix.O_RDWR | unix.O_CREAT
+			} else {
+				mode = unix.O_RDWR
+			}
+			//appExit(fmt.Errorf("bad block device %s", path))
 		}
-		fh, err := unix.Open(path, unix.O_RDWR|unix.O_DIRECT, 0644)
+		fh, err := unix.Open(path, mode, 0644)
+		//fh, err := unix.Open(path, unix.O_RDWR|unix.O_DIRECT, 0644)
 		if err != nil {
 			appExit(err)
 		}
@@ -317,12 +325,20 @@ func loadTargets() {
 
 		fmt.Printf("target %s, path %s, color %d\n", dev, path, color)
 
+		mode := unix.O_RDWR | unix.O_DIRECT
 		if fi, err := os.Stat(path); err != nil {
 			appExit(err)
 		} else if fi.Mode()&fs.ModeDevice == 0 {
-			appExit(fmt.Errorf("bad block device %s", path))
+			fmt.Printf("%s is not a block device\n", path)
+			//appExit(fmt.Errorf("bad block device %s", path))
+			if !*verify {
+				mode = unix.O_RDWR | unix.O_CREAT
+			} else {
+				mode = unix.O_RDWR
+			}
 		}
-		fh, err := unix.Open(path, unix.O_RDWR|unix.O_DIRECT, 0644)
+		//fh, err := unix.Open(path, unix.O_RDWR|unix.O_DIRECT, 0644)
+		fh, err := unix.Open(path, mode, 0644)
 		if err != nil {
 			appExit(err)
 		}
@@ -351,10 +367,11 @@ func do_shuffle() {
 
 	// dev path color(0-15)
 	// 1124864597118850913 /dev/mapper/pwx0-1124864597118850913 2
-	targets, err := os.Open(*devicesFile)
+	targets, err := os.OpenFile(*devicesFile, os.O_RDWR, 0644)
 	if err != nil {
 		appExit(err)
 	}
+	defer targets.Close()
 
 	scanner := bufio.NewScanner(targets)
 
@@ -379,14 +396,15 @@ func do_shuffle() {
 		}
 		gTargets[dev] = targetInfo{path: path, color: color}
 	}
-	targets.Close()
 
-	outb := make([]byte, 4096)
+	var outb []byte
+	//outb := make([]byte, 4096)
 	for tag, ti := range gTargets {
 		// write tag, ti.path ti.color
 		outb = append(outb, []byte(fmt.Sprintf("%s %s %d\n", tag, ti.path, ti.color))...)
 	}
-	if err := os.WriteFile(*devicesFile, outb, 0644); err != nil {
+	targets.Seek(0, 0)
+	if _, err := targets.Write(outb); err != nil {
 		appExit(err)
 	}
 }

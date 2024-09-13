@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"io"
 	"io/fs"
 	"math/rand"
 	"os"
@@ -27,10 +28,16 @@ type resultInfo struct {
 	off int64
 }
 
+type writeRecord struct {
+	off int64
+	qd  uint
+}
+
 type targetInfo struct {
 	path  string
 	fh    int
 	color int
+	vi    []writeRecord
 }
 
 const (
@@ -55,10 +62,11 @@ var (
 	devicesFile = flag.String("targets", "", "load target devices from given file")
 	shuffle     = flag.Bool("shuffle", false, "shuffle data color and rebuild targets")
 	random      = flag.Bool("random", false, "generate random offsets every iteration")
+	flush       = flag.Int("flush", 0, "flush freq, 0 - to disable, otherwise cycle freq")
 
 	journalFilePath = "/var/cores/lns/j.dat"
-
-	gTargets = map[string]targetInfo{}
+	gTargets        = map[string]targetInfo{}
+	gFlush          = int(0) // global sync freq (iteration cycles)
 )
 
 func appExit(err error) {
@@ -130,11 +138,7 @@ func writeOneIter(outerwg *sync.WaitGroup, tgt string, off int64) {
 	wg.Wait()
 	close(rchan)
 
-	if err := syscall.Fsync(targetfh(tgt)); err != nil {
-		appExit(err)
-	}
-
-	// write journal out tuple <off q>
+	// track write record - not synced yet - just inflight writes that are acknowledged without sync
 	jlock.Lock()
 	defer jlock.Unlock()
 	outb := []byte(fmt.Sprintf("%s %d %d\n", tgt, off, p.q))
@@ -210,6 +214,28 @@ func verifyOneIter(tgt string, off int64, q uint) {
 	}
 }
 
+func buildCtxToVerify(tgt string, off int64, qd uint) {
+	if *flush == 0 {
+		// unstable write mode check - no fsync from app still verifying
+		verifyOneIter(tgt, off, qd)
+		return
+	}
+
+	ti := gTargets[tgt] // verify info for each target
+	if qd == 0 {
+		// got a sync record for this device
+		for _, rec := range ti.vi {
+			verifyOneIter(tgt, rec.off, rec.qd)
+		}
+		ti.vi = []writeRecord{}
+		gTargets[tgt] = ti
+		return
+	}
+
+	ti.vi = append(ti.vi, writeRecord{off: off, qd: qd})
+	gTargets[tgt] = ti
+}
+
 func do_verify() {
 	jlog, err := os.Open(journalFilePath)
 	if err != nil {
@@ -218,6 +244,10 @@ func do_verify() {
 	defer jlog.Close()
 
 	scanner := bufio.NewScanner(jlog)
+
+	if *flush == 0 {
+		fmt.Printf("unstable write verification\n")
+	}
 
 	var tgt string
 	var off int64
@@ -230,7 +260,8 @@ func do_verify() {
 		if n != 3 {
 			appExit(fmt.Errorf("incomplete journal %s - quitting\n", scanner.Text()))
 		}
-		verifyOneIter(tgt, off, q)
+		//verifyOneIter(tgt, off, q)
+		buildCtxToVerify(tgt, off, q)
 	}
 
 	fmt.Println("verify done")
@@ -317,6 +348,9 @@ func loadTargets() {
 	for scanner.Scan() {
 		n, err := fmt.Sscanf(scanner.Text(), "%s %s %d", &dev, &path, &color)
 		if err != nil {
+			if err == io.EOF {
+				break
+			}
 			appExit(fmt.Errorf("parse failure %s, err %v", scanner.Text(), err))
 		}
 		if n != 3 {
@@ -345,6 +379,7 @@ func loadTargets() {
 		if color > 15 || color < 0 {
 			color = *seed // write default if out of bounds
 		}
+		fmt.Printf("tgt %s: using color %d\n", dev, color)
 		gTargets[dev] = targetInfo{path: path, fh: fh, color: color}
 	}
 }
@@ -381,6 +416,9 @@ func do_shuffle() {
 	for scanner.Scan() {
 		n, err := fmt.Sscanf(scanner.Text(), "%s %s %d", &dev, &path, &color)
 		if err != nil {
+			if err == io.EOF {
+				break
+			}
 			appExit(fmt.Errorf("parse failure %s, err %v", scanner.Text(), err))
 		}
 		if n != 3 {
@@ -388,11 +426,13 @@ func do_shuffle() {
 		}
 
 		fmt.Printf("target %s, path %s, color %d\n", dev, path, color)
-
-		if color > 15 || color < 0 {
-			color = *seed // write default if out of bounds
-		} else {
-			color = rand.Intn(MAXCOLORS)
+		for {
+			newColor := rand.Intn(MAXCOLORS)
+			if newColor == color {
+				continue
+			}
+			color = newColor
+			break
 		}
 		gTargets[dev] = targetInfo{path: path, color: color}
 	}
@@ -407,6 +447,24 @@ func do_shuffle() {
 	if _, err := targets.Write(outb); err != nil {
 		appExit(err)
 	}
+}
+
+func do_sync_work(curOff int64) {
+	outb := []byte{}
+	for tgt, ti := range gTargets {
+		if err := syscall.Fsync(ti.fh); err != nil {
+			appExit(err)
+		}
+		outb = append(outb, []byte(fmt.Sprintf("%s %d 0\n", tgt, curOff))...)
+	}
+	// sync record
+	n, err := syscall.Write(int(journalFile.Fd()), outb)
+	if err != nil {
+		appExit(err)
+	} else if n != len(outb) {
+		appExit(fmt.Errorf("size mismatch journal"))
+	}
+	gFlush = *flush
 }
 
 func main() {
@@ -452,6 +510,7 @@ func main() {
 
 	nWrites := p.size / 4096
 	nIterations := int64(nWrites / uint64(p.q))
+	gFlush = *flush
 
 	// starting off
 	off := rand.Int63n(nIterations)
@@ -465,12 +524,23 @@ func main() {
 		}
 		wg.Wait()
 
+		// covered upto this offset on all devices this iteration
+		byteOff += (4096 * int64(p.q))
+
+		// write journal out tuple <off q> if enabled
+		if gFlush > 0 {
+			gFlush--
+			if gFlush == 0 {
+				// covered upto byteOff += (4096 * int64(p.q))
+				do_sync_work(byteOff)
+			}
+		}
+
 		if *random {
 			// can overwrite
 			byteOff = rand.Int63n(nIterations) * 4096 * int64(p.q)
 		} else {
-			// sequential qdepth * 4k range covered
-			byteOff += (4096 * int64(p.q))
+			// sequential - continue from where we left off next cycle
 			if uint64(byteOff) >= p.size {
 				byteOff = 0
 			}

@@ -7,9 +7,11 @@
 for p in $(cat mytargets |  awk '{print $2}'); do 
 
 if [ -b "$p" ]; then
-  echo "discard $p" && blkdiscard $p;
+  echo "discard $p"
+  blkdiscard $p
 else
 
+  echo "check setting up mounting path $p"
 #mkdir -p /var/lib/osd/mounts/vol1
 
 #umount /var/lib/osd/mounts/vol1
@@ -32,6 +34,7 @@ else
 #done
 
 fi
+done
 
 ./iotest -targets ./mytargets -shuffle
 dmsetup message /dev/mapper/pwx1-pxpool-tpool 0 reserve_metadata_snap

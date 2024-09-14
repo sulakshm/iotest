@@ -505,6 +505,9 @@ func do_shuffle() {
 	if _, err := targets.Write(outb); err != nil {
 		appExit(err)
 	}
+	if err := targets.Sync(); err != nil {
+		appExit(err)
+	}
 }
 
 // called under journal lock

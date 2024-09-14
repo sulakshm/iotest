@@ -478,7 +478,6 @@ func do_shuffle() {
 			appExit(fmt.Errorf("incomplete targets %s - quitting\n", scanner.Text()))
 		}
 
-		fmt.Printf("target %s, path %s, color %d\n", dev, path, color)
 		for {
 			newColor := rng.Intn(MAXCOLORS)
 			if newColor == color {
@@ -487,6 +486,7 @@ func do_shuffle() {
 			color = newColor
 			break
 		}
+		fmt.Printf("shuffled->target %s, path %s, color %d\n", dev, path, color)
 		gTargets[dev] = targetInfo{path: path, color: color}
 	}
 

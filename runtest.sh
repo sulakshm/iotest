@@ -4,7 +4,11 @@
 ## create the targets(mytargets file under /var/cores/lns) list of devices (tag, path, data color[0-15])
 ## run from /var/cores/lns - setup dir
 
-for p in $(cat mytargets |  awk '{print $2}'); do blkdiscard $p; done
+for p in $(cat mytargets |  awk '{print $2}'); do 
+
+if [ -b "$p" ]; then
+  echo "discard $p" && blkdiscard $p;
+else
 
 #mkdir -p /var/lib/osd/mounts/vol1
 
@@ -26,6 +30,8 @@ for p in $(cat mytargets |  awk '{print $2}'); do blkdiscard $p; done
 #rm -f /var/lib/osd/mounts/vol$i/test
 #truncate -s200G /var/lib/osd/mounts/vol$i/test
 #done
+
+fi
 
 ./iotest -targets ./mytargets -shuffle
 dmsetup message /dev/mapper/pwx1-pxpool-tpool 0 reserve_metadata_snap

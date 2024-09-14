@@ -24,4 +24,3 @@ dmsetup message /dev/mapper/pwx1-pxpool-tpool 0 release_metadata_snap
 #dmsetup message /dev/mapper/pwx2-pxpool-tpool 0 release_metadata_snap
 
 ./iotest -targets ./mytargets -verify -flush 64
-

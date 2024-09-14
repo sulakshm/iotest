@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -467,15 +468,19 @@ func do_shuffle() {
 	var path string
 	var color int
 	for scanner.Scan() {
-		n, err := fmt.Sscanf(scanner.Text(), "%s %s %d", &dev, &path, &color)
+		input := strings.TrimSpace(scanner.Text())
+		if len(input) == 0 {
+			continue
+		}
+		n, err := fmt.Sscanf(input, "%s %s %d", &dev, &path, &color)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			appExit(fmt.Errorf("parse failure %s, err %v", scanner.Text(), err))
+			appExit(fmt.Errorf("parse failure %s, err %v", input, err))
 		}
 		if n != 3 {
-			appExit(fmt.Errorf("incomplete targets %s - quitting\n", scanner.Text()))
+			appExit(fmt.Errorf("incomplete targets %s - quitting\n", input))
 		}
 
 		for {

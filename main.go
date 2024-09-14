@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type inParams struct {
@@ -38,6 +39,7 @@ type targetInfo struct {
 	fh    int
 	color int
 	vi    []writeRecord
+	mode  int
 }
 
 const (
@@ -63,10 +65,13 @@ var (
 	shuffle     = flag.Bool("shuffle", false, "shuffle data color and rebuild targets")
 	random      = flag.Bool("random", false, "generate random offsets every iteration")
 	flush       = flag.Int("flush", 0, "flush freq, 0 - to disable, otherwise cycle freq")
+	single      = flag.Bool("single", false, "keep single fds for syncing")
 
 	journalFilePath = "/var/cores/lns/j.dat"
 	gTargets        = map[string]targetInfo{}
 	gFlush          = int(0) // global sync freq (iteration cycles)
+
+	rng *rand.Rand
 )
 
 func appExit(err error) {
@@ -105,13 +110,13 @@ func prepBuffer(i int) {
 	}
 }
 
-func writeOut(tgt string, wg *sync.WaitGroup, off int64, rchan chan resultInfo) {
+func writeOut(tgt string, wg *sync.WaitGroup, fh int, off int64, color int, rchan chan resultInfo) {
 	defer wg.Done()
 	//color := (off / 4096) % NBUFS
-	color := targetcolor(tgt)
+	nblocks := len(data[color]) / 4096
 
 	// fmt.Printf("Page write at %d, len %d, color %d\n", off, len(data[color]), color)
-	n, err := syscall.Pwrite(targetfh(tgt), data[color], off)
+	n, err := syscall.Pwrite(fh, data[color], off)
 	if err != nil {
 		appExit(err)
 	}
@@ -120,10 +125,69 @@ func writeOut(tgt string, wg *sync.WaitGroup, off int64, rchan chan resultInfo) 
 		appExit(fmt.Errorf("write size mismatch %d, expected %d", n, len(data[color])))
 	}
 
+	// track write record - not synced yet - just inflight writes that are acknowledged without sync
+	/*
+		outb := []byte(fmt.Sprintf("%s %d %d\n", tgt, off, nblocks))
+		jlock.Lock()
+		n, err := syscall.Write(int(journalFile.Fd()), outb)
+		if err != nil {
+			appExit(err)
+		} else if n != len(outb) {
+			appExit(fmt.Errorf("size mismatch journal"))
+		}
+		jlock.Unlock()
+	*/
+	trackDirty(tgt, len(data[color]), &writeRecord{off: off, qd: uint(nblocks)})
 	rchan <- resultInfo{tgt: tgt, n: 0, off: off}
 }
 
-func writeOneIter(outerwg *sync.WaitGroup, tgt string, off int64) {
+const (
+	DIRTY_THRESHOLD = int(100 * (1 << 20))
+)
+
+var (
+	gDirty    int
+	flush_now bool
+	dosync    *sync.Cond
+)
+
+func syncer() {
+	fmt.Println("background syncer active")
+	// wait forever for the signal
+	for {
+		dosync.L.Lock()
+		for !flush_now {
+			dosync.Wait()
+		}
+		flush_now = false
+		do_sync_work(0)
+		dosync.L.Unlock()
+	}
+}
+
+func syncInit() {
+	dosync = sync.NewCond(&jlock)
+	gDirty = 0
+	flush_now = false
+	go syncer()
+}
+
+// called under jlock - so no more locks needed
+func trackDirty(tgt string, dbytes int, wrec *writeRecord) {
+	dosync.L.Lock()
+	gDirty += dbytes
+	ti := gTargets[tgt]
+	ti.vi = append(ti.vi, *wrec) // collect unstable writes in memory
+	gTargets[tgt] = ti
+	if gDirty >= DIRTY_THRESHOLD {
+		flush_now = true
+		gDirty = 0
+		dosync.Signal()
+	}
+	dosync.L.Unlock()
+}
+
+func writeOneIter(outerwg *sync.WaitGroup, tgt string, fh int, off int64, color int) {
 	defer outerwg.Done()
 
 	wg := sync.WaitGroup{}
@@ -132,22 +196,11 @@ func writeOneIter(outerwg *sync.WaitGroup, tgt string, off int64) {
 	for i := uint(0); i < p.q; i++ {
 		wg.Add(1)
 
-		go writeOut(tgt, &wg, off+int64(i)*4096, rchan)
+		go writeOut(tgt, &wg, fh, off+int64(i)*4096, color, rchan)
 	}
 
 	wg.Wait()
 	close(rchan)
-
-	// track write record - not synced yet - just inflight writes that are acknowledged without sync
-	jlock.Lock()
-	defer jlock.Unlock()
-	outb := []byte(fmt.Sprintf("%s %d %d\n", tgt, off, p.q))
-	n, err := syscall.Write(int(journalFile.Fd()), outb)
-	if err != nil {
-		appExit(err)
-	} else if n != len(outb) {
-		appExit(fmt.Errorf("size mismatch journal"))
-	}
 }
 
 func verifyIn(tgt string, wg *sync.WaitGroup, off int64, rchan chan resultInfo) {
@@ -328,7 +381,7 @@ func loadTargets() {
 		if err != nil {
 			appExit(err)
 		}
-		gTargets["def"] = targetInfo{path: path, fh: fh, color: *seed}
+		gTargets["def"] = targetInfo{path: path, fh: fh, color: *seed, mode: mode}
 		return
 	}
 
@@ -380,7 +433,7 @@ func loadTargets() {
 			color = *seed // write default if out of bounds
 		}
 		fmt.Printf("tgt %s: using color %d\n", dev, color)
-		gTargets[dev] = targetInfo{path: path, fh: fh, color: color}
+		gTargets[dev] = targetInfo{path: path, fh: fh, color: color, mode: mode}
 	}
 }
 
@@ -427,7 +480,7 @@ func do_shuffle() {
 
 		fmt.Printf("target %s, path %s, color %d\n", dev, path, color)
 		for {
-			newColor := rand.Intn(MAXCOLORS)
+			newColor := rng.Intn(MAXCOLORS)
 			if newColor == color {
 				continue
 			}
@@ -449,15 +502,73 @@ func do_shuffle() {
 	}
 }
 
+// called under journal lock
 func do_sync_work(curOff int64) {
-	outb := []byte{}
+	type tgtPathInfo struct {
+		path string
+		mode int
+		fh   int
+		skip bool // skip sync
+	}
+	dirtyMap := make(map[string][]writeRecord)
+	tgtFhMap := make(map[string]tgtPathInfo)
+	// writeout unstable journal recs
 	for tgt, ti := range gTargets {
-		if err := syscall.Fsync(ti.fh); err != nil {
+		dirtyMap[tgt] = ti.vi
+		ti.vi = []writeRecord{}
+		gTargets[tgt] = ti
+
+		tgtFhMap[tgt] = tgtPathInfo{path: ti.path, mode: ti.mode, fh: ti.fh}
+	}
+	jlock.Unlock()
+
+	for tgt, wrecs := range dirtyMap {
+		outb := []byte{}
+		for _, wrec := range wrecs {
+			outb = append(outb, []byte(fmt.Sprintf("%s %d %d\n", tgt, wrec.off, wrec.qd))...)
+		}
+		if len(outb) == 0 {
+			rec := tgtFhMap[tgt]
+			rec.skip = true
+			tgtFhMap[tgt] = rec
+			continue
+		}
+		jlock.Lock()
+		// single update of all unstable records
+		n, err := syscall.Write(int(journalFile.Fd()), outb)
+		if err != nil {
 			appExit(err)
+		} else if n != len(outb) {
+			appExit(fmt.Errorf("size mismatch journal"))
+		}
+		jlock.Unlock()
+	}
+
+	// do the sync outside jlock
+	outb := []byte{}
+	for tgt, ti := range tgtFhMap {
+		if ti.skip {
+			continue
+		}
+		localfd := ti.fh
+		if !*single {
+			newfd, err := unix.Open(ti.path, ti.mode, 0644)
+			if err != nil {
+				appExit(err)
+			}
+			localfd = newfd
+		}
+		if err := syscall.Fsync(localfd); err != nil {
+			appExit(err)
+		}
+		if !*single {
+			unix.Close(localfd)
 		}
 		outb = append(outb, []byte(fmt.Sprintf("%s %d 0\n", tgt, curOff))...)
 	}
-	// sync record
+
+	jlock.Lock()
+	// write sync record - this tracks unstable writes above
 	n, err := syscall.Write(int(journalFile.Fd()), outb)
 	if err != nil {
 		appExit(err)
@@ -475,6 +586,8 @@ func main() {
 		fmt.Printf("seed(%d) out of bounds, reset to 0\n", *seed)
 		*seed = 0
 	}
+
+	rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	if *shuffle {
 		do_shuffle()
@@ -508,6 +621,9 @@ func main() {
 		do_verify()
 	}
 
+	// kick start syncer only in write phase
+	syncInit()
+
 	nWrites := p.size / 4096
 	nIterations := int64(nWrites / uint64(p.q))
 	gFlush = *flush
@@ -518,9 +634,9 @@ func main() {
 	for iter := int64(0); iter < nIterations; iter++ {
 		wg := sync.WaitGroup{}
 		// IO to all devices in parallel
-		for tgt := range gTargets {
+		for tgt, ti := range gTargets {
 			wg.Add(1)
-			go writeOneIter(&wg, tgt, byteOff)
+			go writeOneIter(&wg, tgt, ti.fh, byteOff, ti.color)
 		}
 		wg.Wait()
 
@@ -528,13 +644,15 @@ func main() {
 		byteOff += (4096 * int64(p.q))
 
 		// write journal out tuple <off q> if enabled
-		if gFlush > 0 {
-			gFlush--
-			if gFlush == 0 {
-				// covered upto byteOff += (4096 * int64(p.q))
-				do_sync_work(byteOff)
+		/*
+			if gFlush > 0 {
+				gFlush--
+				if gFlush == 0 {
+					// covered upto byteOff += (4096 * int64(p.q))
+					do_sync_work(byteOff)
+				}
 			}
-		}
+		*/
 
 		if *random {
 			// can overwrite

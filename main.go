@@ -307,12 +307,16 @@ func do_verify() {
 	var off int64
 	var q uint
 	for scanner.Scan() {
-		n, err := fmt.Sscanf(scanner.Text(), "%s %d %d", &tgt, &off, &q)
+		input := strings.TrimSpace(scanner.Text())
+		if len(input) == 0 {
+			continue
+		}
+		n, err := fmt.Sscanf(input, "%s %d %d", &tgt, &off, &q)
 		if err != nil {
-			appExit(fmt.Errorf("parse failure %s, err %v", scanner.Text(), err))
+			appExit(fmt.Errorf("parse failure %s, err %v", input, err))
 		}
 		if n != 3 {
-			appExit(fmt.Errorf("incomplete journal %s - quitting\n", scanner.Text()))
+			appExit(fmt.Errorf("incomplete journal %s - quitting\n", input))
 		}
 		//verifyOneIter(tgt, off, q)
 		buildCtxToVerify(tgt, off, q)
@@ -400,15 +404,19 @@ func loadTargets() {
 	var path string
 	var color int
 	for scanner.Scan() {
-		n, err := fmt.Sscanf(scanner.Text(), "%s %s %d", &dev, &path, &color)
+		input := strings.TrimSpace(scanner.Text())
+		if len(input) == 0 {
+			continue
+		}
+		n, err := fmt.Sscanf(input, "%s %s %d", &dev, &path, &color)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			appExit(fmt.Errorf("parse failure %s, err %v", scanner.Text(), err))
+			appExit(fmt.Errorf("parse failure %s, err %v", input, err))
 		}
 		if n != 3 {
-			appExit(fmt.Errorf("incomplete targets %s - quitting\n", scanner.Text()))
+			appExit(fmt.Errorf("incomplete targets %s - quitting\n", input))
 		}
 
 		fmt.Printf("target %s, path %s, color %d\n", dev, path, color)

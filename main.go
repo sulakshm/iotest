@@ -72,6 +72,9 @@ var (
 	gTargets        = map[string]targetInfo{}
 	gFlush          = int(0) // global sync freq (iteration cycles)
 
+	// sync iteration
+	gIter = int(0)
+
 	rng *rand.Rand
 )
 
@@ -79,6 +82,17 @@ func appExit(err error) {
 	fmt.Printf("failed with error %v", err)
 	debug.PrintStack()
 	os.Exit(1)
+}
+
+func do_force_crash() {
+	f, err := os.OpenFile("/proc/sysrq-trigger", os.O_WRONLY, 0644)
+	if err != nil {
+		appExit(err)
+	}
+	// immediate reboot 'b'
+	// kernel crash 'c'
+	f.WriteString("b")
+	f.Close()
 }
 
 func targetfh(tgt string) int {
@@ -590,6 +604,11 @@ func do_sync_work(curOff int64) {
 		appExit(err)
 	} else if n != len(outb) {
 		appExit(fmt.Errorf("size mismatch journal"))
+	}
+
+	gIter++
+	if gIter == 2 {
+		do_force_crash()
 	}
 	gFlush = *flush
 }

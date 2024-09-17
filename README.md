@@ -1,5 +1,5 @@
 # iotest
-
+This is a special tool to test IO integrity during power cycles, abrupt power off conditions. A journal is recorded and only IOs until the sync point are checked for consistency.
 
 ## setup
 1. create a top level work dir /var/cores/lns

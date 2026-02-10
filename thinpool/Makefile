@@ -1,32 +1,42 @@
 # LVM Thin Pool Stress Test - Makefile
 #
 # Common operations for thin pool stress testing
+# Purpose: Reproduce 'space map common: unable to decrement block' errors
 #
 
 .PHONY: help install check clean test-quick test-standard test-stress analyze
+.PHONY: test-race test-metadata-exhaustion test-max-stress test-baseline analyze-kernel
 
 # Default target
 help:
 	@echo "LVM Thin Pool Stress Test - Available Targets"
+	@echo "Purpose: Reproduce 'space map common: unable to decrement block' errors"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make install        - Install required dependencies"
 	@echo "  make check          - Check system requirements"
 	@echo "  make permissions    - Make scripts executable"
 	@echo ""
-	@echo "Testing:"
-	@echo "  make test-quick     - Run quick 30-minute test"
-	@echo "  make test-standard  - Run standard 4-hour test"
-	@echo "  make test-stress    - Run high stress 8-hour test"
-	@echo "  make test-custom    - Run with custom parameters"
+	@echo "Race Condition Tests (Recommended):"
+	@echo "  make test-race           - Quick race test (30 min, concurrent I/O+discard)"
+	@echo "  make test-metadata-exhaustion - Metadata exhaustion test (4h, 512M tmeta)"
+	@echo "  make test-max-stress     - Maximum stress (8h, 8 parallel, 95% capacity)"
+	@echo ""
+	@echo "Baseline Tests (No Race Mode):"
+	@echo "  make test-baseline       - Baseline test (4h, sequential operations)"
+	@echo "  make test-quick          - Quick 30-minute test (race mode enabled)"
+	@echo "  make test-standard       - Standard 4-hour test (race mode enabled)"
+	@echo "  make test-stress         - High stress 8-hour test (race mode enabled)"
+	@echo "  make test-custom         - Run with custom parameters"
 	@echo ""
 	@echo "Analysis:"
-	@echo "  make analyze        - Analyze latest test logs"
-	@echo "  make report         - Generate detailed report"
+	@echo "  make analyze             - Analyze latest test logs"
+	@echo "  make analyze-kernel      - Analyze logs + check kernel for errors"
+	@echo "  make report              - Generate detailed report"
 	@echo ""
 	@echo "Cleanup:"
-	@echo "  make clean          - Remove log files"
-	@echo "  make clean-lvm      - Emergency LVM cleanup"
+	@echo "  make clean               - Remove log files"
+	@echo "  make clean-lvm           - Emergency LVM cleanup"
 	@echo ""
 	@echo "Environment Variables:"
 	@echo "  DRIVES              - Drives to use (e.g., /dev/sdb,/dev/sdc)"
@@ -131,8 +141,81 @@ test-custom:
 		-h $(or $(HOURS),4) \
 		-i $(or $(ITERATIONS),0) \
 		-n $(or $(VOLUMES),16) \
-		-c $(or $(CAPACITY),50) \
+		-c $(or $(CAPACITY),80) \
 		-v $(or $(MODE),raw)
+
+# Race condition test (30 min, concurrent I/O+discard)
+test-race:
+	@if [ -z "$(DRIVES)" ]; then \
+		echo "Error: DRIVES variable not set"; \
+		echo "Usage: make test-race DRIVES=/dev/sdb,/dev/sdc"; \
+		exit 1; \
+	fi
+	@echo "Running race condition test (30 min, concurrent I/O+discard)..."
+	sudo ./thin_pool_stress_test.sh \
+		-d $(DRIVES) \
+		-p 4 \
+		-h 0.5 \
+		-n 16 \
+		-c 80 \
+		-v raw \
+		--race-mode enabled \
+		--snapshot-io-duration 30
+
+# Metadata exhaustion test (MOST LIKELY TO TRIGGER CORRUPTION)
+test-metadata-exhaustion:
+	@if [ -z "$(DRIVES)" ]; then \
+		echo "Error: DRIVES variable not set"; \
+		echo "Usage: make test-metadata-exhaustion DRIVES=/dev/sdb,/dev/sdc"; \
+		exit 1; \
+	fi
+	@echo "Running metadata exhaustion test (4h, 512M tmeta)..."
+	@echo "This test uses minimal metadata to stress tmeta to near-100%"
+	sudo ./thin_pool_stress_test.sh \
+		-d $(DRIVES) \
+		-p 6 \
+		-h 4 \
+		-n 24 \
+		-c 90 \
+		-v raw \
+		--race-mode enabled \
+		--metadata-stress \
+		--snapshot-io-duration 45
+
+# Maximum stress test (8h, 8 parallel, 95% capacity)
+test-max-stress:
+	@if [ -z "$(DRIVES)" ]; then \
+		echo "Error: DRIVES variable not set"; \
+		echo "Usage: make test-max-stress DRIVES=/dev/sdb,/dev/sdc,/dev/sdd"; \
+		exit 1; \
+	fi
+	@echo "Running maximum stress test (8h, 8 parallel, 95% capacity)..."
+	sudo ./thin_pool_stress_test.sh \
+		-d $(DRIVES) \
+		-p 8 \
+		-h 8 \
+		-n 16 \
+		-c 95 \
+		-v raw \
+		--race-mode enabled \
+		--snapshot-io-duration 60
+
+# Baseline test (no race mode, for comparison)
+test-baseline:
+	@if [ -z "$(DRIVES)" ]; then \
+		echo "Error: DRIVES variable not set"; \
+		echo "Usage: make test-baseline DRIVES=/dev/sdb,/dev/sdc"; \
+		exit 1; \
+	fi
+	@echo "Running baseline test (4h, no race mode)..."
+	sudo ./thin_pool_stress_test.sh \
+		-d $(DRIVES) \
+		-p 4 \
+		-h 4 \
+		-n 16 \
+		-c 80 \
+		-v raw \
+		--no-race-mode
 
 # Analyze latest logs
 analyze:
@@ -142,6 +225,15 @@ analyze:
 	fi
 	@echo "Analyzing latest test logs..."
 	sudo ./analyze_thin_pool_logs.sh thin_pool_stress_logs
+
+# Analyze with kernel error checking
+analyze-kernel:
+	@if [ ! -d "thin_pool_stress_logs" ]; then \
+		echo "Error: No log directory found"; \
+		exit 1; \
+	fi
+	@echo "Analyzing latest test logs with kernel error check..."
+	sudo ./analyze_thin_pool_logs.sh thin_pool_stress_logs --check-kernel --verbose
 
 # Generate detailed report
 report: analyze

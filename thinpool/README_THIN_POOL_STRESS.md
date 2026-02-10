@@ -2,27 +2,39 @@
 
 ## Overview
 
-This script performs comprehensive stress testing of LVM thin pools by:
-- Creating a thin pool with configurable metadata size
-- Provisioning multiple thin volumes
-- Running continuous I/O workload on half the volumes
-- Cycling (delete/recreate) the other half with configurable parallelism
-- Collecting detailed I/O statistics and pool usage metrics
+This script performs comprehensive stress testing of LVM thin pools, specifically designed to **reproduce the "space map common: unable to decrement block" refcount corruption error**.
+
+### Target Issue
+The kernel error occurs when:
+- **Discard/TRIM Race Conditions**: Concurrent discard and write/delete operations hit the same block
+- **Metadata Exhaustion**: tmeta fills to 100%, corrupting B-tree transactions
+- **Unsafe Caching**: Partial metadata writes during power failure
+
+### How It Works
+- Creates a thin pool with configurable metadata size
+- Provisions multiple thin volumes (default: 16)
+- Runs continuous I/O workload on half the volumes
+- **Race Mode (default)**: Runs I/O and discard **concurrently** to trigger race conditions
+- Cycles (snapshot → I/O → discard → delete) the other half with configurable parallelism
+- Monitors for kernel errors and metadata exhaustion
 
 ## Features
 
 ### Core Functionality
-- ✅ **Configurable Thin Pool**: 15G metadata (default), passdown discard, skip zeroing
+- ✅ **Configurable Thin Pool**: 15G metadata (default) or 512M (metadata stress mode)
 - ✅ **Parallel Volume Operations**: 1-8 volumes deleted/recreated simultaneously
-- ✅ **Continuous I/O**: FIO-based workload with mixed read/write patterns
-- ✅ **Discard Operations**: blkdiscard before volume deletion
-- ✅ **Flexible Volume Modes**: Raw block devices or formatted filesystems (ext4)
+- ✅ **Race Mode**: Concurrent I/O and discard operations (enabled by default)
+- ✅ **Snapshot Operations**: Create snapshot before delete to stress COW refcounts
+- ✅ **Aggressive Discard**: Multiple rapid partial discards per volume
+- ✅ **Metadata Stress**: Option to use minimal metadata for exhaustion testing
+- ✅ **Kernel Error Detection**: Monitors dmesg for thin pool errors
 
 ### Statistics Collection
 - ✅ **Per-Iteration I/O Stats**: Read/Write/Discard/Flush operations and bytes
 - ✅ **Aggregate Statistics**: Cumulative I/O since test start
-- ✅ **Pool Usage Tracking**: Data and metadata utilization percentages
-- ✅ **Operation Counters**: Total creates, deletes, discards
+- ✅ **Pool Usage Tracking**: Data and metadata utilization percentages (continuous monitoring)
+- ✅ **Kernel Error Logging**: Captures "unable to decrement block" errors
+- ✅ **Metadata Exhaustion Alerts**: Warns at 80%, critical at 95%
 
 ### Runtime Control
 - ✅ **Indefinite Mode**: Run until manually stopped
@@ -95,25 +107,34 @@ yum install -y lvm2 fio util-linux
 |--------|-------------|---------|
 | `-d, --drives` | Comma-separated list of drives | `-d /dev/sdb,/dev/sdc` |
 
-### Optional Options
+### Basic Options
 | Option | Description | Default | Range/Values |
 |--------|-------------|---------|--------------|
 | `-p, --parallel-deletes` | Number of parallel volume deletes | 2 | 1-8 |
 | `-h, --max-hours` | Maximum runtime in hours (0=indefinite) | 0 | 0+ |
 | `-i, --max-iterations` | Maximum iterations (0=indefinite) | 0 | 0+ |
 | `-m, --metadata-size` | Metadata volume size | 15G | Size string |
-| `-c, --capacity-percent` | Pool capacity to use for volumes | 50 | 1-100 |
+| `-c, --capacity-percent` | Pool capacity to use for volumes | 80 | 1-100 |
 | `-n, --num-volumes` | Total number of thin volumes | 16 | 2+ |
 | `-v, --volume-mode` | Volume mode | raw | raw, formatted |
 | `-l, --log-dir` | Log directory | ./thin_pool_stress_logs | Path |
 | `--vg-name` | Volume group name | stress_vg | String |
 | `--pool-name` | Thin pool name | stress_pool | String |
 
+### Race Condition Options (for reproducing refcount corruption)
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--race-mode MODE` | Enable/disable concurrent I/O+discard | enabled |
+| `--no-race-mode` | Shortcut to disable race mode | - |
+| `--metadata-stress` | Use minimal 512M metadata (stress tmeta) | disabled |
+| `--fstrim-mode` | Use fstrim on mounted filesystems | disabled |
+| `--snapshot-io-duration SECS` | I/O duration during snapshot phase | 30 |
+
 ## Output and Logs
 
 ### Log Files
 
-The script creates three main log files in the log directory:
+The script creates the following log files in the log directory:
 
 #### 1. Main Log (`stress_test_YYYYMMDD_HHMMSS.log`)
 - General execution log
@@ -136,6 +157,19 @@ Iteration,Phase,Device,Read_Ops,Read_Bytes,Write_Ops,Write_Bytes,Discard_Ops,Dis
 1,after,/dev/sdb,1500,6144000,3000,12288000,100,1048576000,15
 1,delta,/dev/sdb,500,2048000,1000,4096000,100,1048576000,5
 1,aggregate,ALL,500,2048000,1000,4096000,100,1048576000,5
+```
+
+#### 4. Kernel Errors Log (`kernel_errors.log`)
+**Critical for detecting refcount corruption!**
+```
+device-mapper: thin: space map common: unable to decrement block
+device-mapper: thin: Couldn't decrement superblock
+```
+
+#### 5. Metadata Warnings Log (`metadata_warnings.log`)
+```
+Mon Feb 10 12:45:23 2026: METADATA CRITICAL - 96.2%
+Mon Feb 10 12:46:15 2026: METADATA CRITICAL - 98.1%
 ```
 
 ### Console Output
@@ -177,23 +211,23 @@ This Iteration I/O:
 
 2. **Volume Creation**
    - Create N thin volumes (default: 16)
-   - Calculate volume size based on pool capacity percentage
+   - Calculate volume size based on pool capacity percentage (default: 80%)
    - Format volumes if mode=formatted
 
 3. **Iteration Loop** (until max hours/iterations reached)
    - **Capture I/O stats (before)**
    - **Start I/O workload** on first 8 volumes (FIO)
-   - **Cycle volumes** (second 8 volumes):
-     - Unmount (if formatted)
-     - Run blkdiscard
-     - Delete volumes
-     - Recreate volumes
-     - Format and mount (if formatted)
+   - **Cycle volumes** (second 8 volumes) - **NEW 6-STEP SEQUENCE**:
+     1. **Take snapshot** of the volume
+     2. **Write I/O** for configurable duration (triggers COW)
+     3. **Race Mode**: Run I/O and discard **concurrently**
+     4. **Delete volume** (with background discard race)
+     5. **Delete snapshot**
+     6. **Recreate volume**
+   - **Check for kernel errors** (dmesg monitoring)
    - **Stop I/O workload**
    - **Capture I/O stats (after)**
-   - **Calculate deltas and aggregates**
-   - **Log statistics**
-   - **Print summary**
+   - **Log statistics and warnings**
 
 4. **Cleanup Phase**
    - Stop all I/O processes
@@ -203,16 +237,35 @@ This Iteration I/O:
    - Remove volume group
    - Remove physical volumes
 
+### Race Mode Details (Default: Enabled)
+
+The race mode is designed to trigger the "unable to decrement block" error:
+
+1. **Concurrent I/O + Discard**
+   - FIO writes random data while blkdiscard runs on same volume
+   - Queue depth 32 for maximum concurrency
+   - Partial discards (4 regions per volume) to increase race opportunities
+
+2. **Aggressive Discard**
+   - 5 rapid discard iterations per volume
+   - Discards on both volume AND snapshot simultaneously
+   - Background discard during lvremove
+
+3. **Metadata Stress Mode** (optional)
+   - Uses 512M metadata instead of 15G
+   - Forces tmeta to approach 100% usage
+   - Most likely to trigger refcount corruption
+
 ### I/O Workload Details
 
 FIO configuration per volume:
-- **Pattern**: Random read/write (70% read, 30% write)
+- **Pattern**: Random write (100% for race mode, 70/30 for baseline)
 - **Block Size**: 4KB
 - **I/O Engine**: libaio
-- **Queue Depth**: 16
+- **Queue Depth**: 32 (race mode) or 16 (baseline)
 - **Direct I/O**: Enabled
-- **Size**: 90% of volume
-- **Runtime**: Continuous until stopped
+- **Size**: 50% of volume (race mode) or 90% (baseline)
+- **Runtime**: Configurable (default 30s per cycle)
 
 ## Safety and Cleanup
 

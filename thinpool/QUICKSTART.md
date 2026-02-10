@@ -1,5 +1,12 @@
 # LVM Thin Pool Stress Test - Quick Start Guide
 
+## Purpose
+
+This tool is designed to **reproduce the "space map common: unable to decrement block" error** - a critical thin pool refcount corruption issue caused by:
+- Discard/TRIM race conditions
+- Metadata exhaustion
+- Concurrent I/O and delete operations
+
 ## Prerequisites
 
 ### 1. Install Required Packages
@@ -34,108 +41,98 @@ chmod +x *.sh
 
 ### Step 2: Run a Test Scenario
 
-**Option A: Interactive Menu (Recommended for First Time)**
+**Option A: Interactive Menu (Recommended)**
 ```bash
 sudo ./thin_pool_test_scenarios.sh
 ```
 
-**Option B: Direct Command**
+**Option B: Direct Command - Race Mode (Default)**
 ```bash
-# Quick 30-minute test
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 2 -h 0.5
+# Quick race test (30 min) - concurrent I/O + discard
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 0.5
 
-# Standard 4-hour test
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 4
+# Maximum stress - best chance to trigger corruption
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 8 -c 95 --metadata-stress
 
-# High stress test
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 8 -h 8
+# Metadata exhaustion test
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 6 -c 90 --metadata-stress -h 4
 ```
 
 ### Step 3: Analyze Results
 ```bash
+# Analyze logs and check for refcount errors
 sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs
+
+# Also check current kernel messages
+sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs --check-kernel
 ```
 
-## Common Test Scenarios
+## Recommended Test Scenarios (for Reproducing Corruption)
 
-### 1. Quick Validation Test (30 minutes)
+### 1. Metadata Exhaustion Test (MOST LIKELY TO TRIGGER)
 ```bash
 sudo ./thin_pool_stress_test.sh \
   -d /dev/sdb,/dev/sdc \
-  -p 2 \
-  -h 0.5 \
-  -n 16 \
-  -c 50 \
-  -v raw
-```
-
-**Use Case**: Verify setup and basic functionality
-
-### 2. Standard Stress Test (4 hours)
-```bash
-sudo ./thin_pool_stress_test.sh \
-  -d /dev/sdb,/dev/sdc \
-  -p 4 \
+  -p 6 \
   -h 4 \
-  -n 16 \
-  -c 50 \
-  -v raw
+  -n 24 \
+  -c 90 \
+  --metadata-stress
 ```
+**Purpose**: Uses minimal 512M metadata to stress tmeta to near-100%
 
-**Use Case**: Regular stress testing
-
-### 3. High Stress Test (8 hours)
+### 2. Maximum Race Condition Stress
 ```bash
 sudo ./thin_pool_stress_test.sh \
-  -d /dev/sdb,/dev/sdc,/dev/sdd \
+  -d /dev/sdb,/dev/sdc \
   -p 8 \
   -h 8 \
   -n 16 \
-  -c 80 \
-  -v raw
+  -c 95 \
+  --snapshot-io-duration 60
 ```
+**Purpose**: Maximum parallel operations with concurrent I/O and discard
 
-**Use Case**: Maximum stress with high parallelism
+### 3. Quick Race Validation (30 minutes)
+```bash
+sudo ./thin_pool_stress_test.sh \
+  -d /dev/sdb,/dev/sdc \
+  -p 4 \
+  -h 0.5 \
+  -c 80
+```
+**Purpose**: Fast validation that race mode is working
 
-### 4. Formatted Filesystem Test (4 hours)
+### 4. Formatted + Fstrim Race Test
 ```bash
 sudo ./thin_pool_stress_test.sh \
   -d /dev/sdb,/dev/sdc \
   -p 4 \
   -h 4 \
-  -n 16 \
-  -c 50 \
-  -v formatted
+  -v formatted \
+  --fstrim-mode
 ```
+**Purpose**: Test with mounted filesystems using fstrim
 
-**Use Case**: Test with actual filesystems
-
-### 5. Long-Term Stability Test (7 days)
+### 5. Baseline Test (No Race - for Comparison)
 ```bash
 sudo ./thin_pool_stress_test.sh \
   -d /dev/sdb,/dev/sdc \
-  -p 2 \
-  -h 168 \
-  -n 16 \
-  -c 50 \
-  -v raw
+  -p 4 \
+  -h 4 \
+  --no-race-mode
 ```
+**Purpose**: Sequential operations for baseline comparison
 
-**Use Case**: Long-term reliability testing
-
-### 6. Large Pool Test (32 volumes)
+### 6. Long-Term Stability with Race Mode
 ```bash
 sudo ./thin_pool_stress_test.sh \
-  -d /dev/sdb,/dev/sdc,/dev/sdd,/dev/sde \
-  -p 6 \
-  -h 8 \
-  -n 32 \
-  -c 60 \
-  -v raw \
-  -m 20G
+  -d /dev/sdb,/dev/sdc \
+  -p 4 \
+  -h 168 \
+  -c 80
 ```
-
-**Use Case**: Test with larger configurations
+**Purpose**: 7-day test with race conditions enabled
 
 ## Monitoring During Test
 
@@ -177,6 +174,8 @@ Each iteration shows:
 1. `stress_test_YYYYMMDD_HHMMSS.log` - Main execution log
 2. `stats_YYYYMMDD_HHMMSS.log` - CSV statistics per iteration
 3. `iostat_YYYYMMDD_HHMMSS.log` - Detailed I/O statistics
+4. `kernel_errors.log` - **Thin pool kernel errors (refcount corruption)**
+5. `metadata_warnings.log` - **Metadata exhaustion events**
 
 ## Stopping the Test
 
@@ -207,6 +206,28 @@ sudo pvremove -f /dev/sdb /dev/sdc
 ### Quick Analysis
 ```bash
 sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs
+```
+
+### Check for Refcount Corruption
+```bash
+# Analyze with kernel message check
+sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs --check-kernel
+
+# Check kernel errors log directly
+cat thin_pool_stress_logs/kernel_errors.log
+
+# Check for the target error in dmesg
+sudo dmesg | grep -i "unable to decrement"
+sudo dmesg | grep -i "space map"
+```
+
+### Check Metadata Exhaustion
+```bash
+# View metadata warnings
+cat thin_pool_stress_logs/metadata_warnings.log
+
+# Check for critical events
+grep "CRITICAL" thin_pool_stress_logs/metadata_warnings.log
 ```
 
 ### Manual Analysis
@@ -269,26 +290,29 @@ sudo grep -i "out of memory" /var/log/syslog
 5. **Verify Cleanup**: Check that LVM structures are removed after test
 6. **Use Dedicated Drives**: Never use drives with important data
 
-## Example Workflow
+## Example Workflow (Reproducing Refcount Corruption)
 
 ```bash
 # 1. Prepare environment
 cd pxlens/ioload
 chmod +x *.sh
 
-# 2. Run quick validation
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 2 -h 0.5
+# 2. Run quick race test to validate setup
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 0.5
 
-# 3. Analyze results
-sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs
+# 3. Analyze results - check for kernel errors
+sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs --check-kernel
 
-# 4. If successful, run longer test
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 4
+# 4. Run metadata exhaustion test (most likely to trigger corruption)
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 6 -c 90 --metadata-stress -h 4
 
-# 5. Analyze again
-sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs
+# 5. Analyze for refcount errors
+sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs --check-kernel --verbose
 
-# 6. Archive logs
+# 6. Check kernel messages directly
+sudo dmesg | grep -i "unable to decrement\|space map"
+
+# 7. Archive logs
 tar -czf thin_pool_test_$(date +%Y%m%d).tar.gz thin_pool_stress_logs/
 ```
 
@@ -311,16 +335,26 @@ bash -x ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4
 | `-d` | Drives | 2-4 drives |
 | `-p` | Parallel deletes | 2-4 for stability, 6-8 for stress |
 | `-h` | Max hours | 0.5 (test), 4 (standard), 24+ (long) |
-| `-n` | Number of volumes | 16 (default), 32 (large) |
-| `-c` | Capacity % | 50 (safe), 80 (stress) |
+| `-n` | Number of volumes | 16 (default), 24 (metadata stress) |
+| `-c` | Capacity % | 80 (default), 90-95 (stress) |
 | `-v` | Volume mode | raw (faster), formatted (realistic) |
+
+### Race Condition Parameters
+
+| Parameter | Description | Purpose |
+|-----------|-------------|---------|
+| `--race-mode enabled` | Concurrent I/O+discard | Default - triggers race conditions |
+| `--no-race-mode` | Sequential operations | Baseline comparison |
+| `--metadata-stress` | Use 512M metadata | Stress tmeta to exhaustion |
+| `--fstrim-mode` | Use fstrim on mounted fs | Test filesystem-level TRIM |
+| `--snapshot-io-duration N` | I/O duration in seconds | Longer = more race opportunities |
 
 ## Next Steps
 
 After successful testing:
-1. Review all log files
-2. Compare results across different configurations
-3. Identify any performance bottlenecks
-4. Document findings
-5. Adjust parameters for specific use cases
+1. Check `kernel_errors.log` for "unable to decrement block" errors
+2. Check `metadata_warnings.log` for exhaustion events
+3. Compare race mode vs baseline results
+4. If no corruption detected, increase stress parameters
+5. Document findings and kernel versions tested
 

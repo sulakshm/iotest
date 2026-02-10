@@ -1,41 +1,48 @@
 # LVM Thin Pool Stress Test - Quick Reference
 
+## 🎯 Purpose
+
+Reproduce **"space map common: unable to decrement block"** refcount corruption error.
+
 ## What's New (Latest Update)
 
-### 🎯 Key Changes
+### Race Condition Mode (Default: ENABLED)
+- **Concurrent I/O + Discard**: Runs FIO and blkdiscard simultaneously
+- **Aggressive Discard**: Multiple rapid partial discards per volume
+- **Snapshot Discards**: Discard on both volume AND snapshot
+- **Delete Race**: Background discard during lvremove
 
-1. **Default Capacity: 50% → 80%**
-   - More aggressive stress testing by default
-   - Volumes now use 80% of pool capacity
+### Metadata Exhaustion Testing
+- **`--metadata-stress`**: Use 512M metadata instead of 15G
+- Forces tmeta to approach 100% - most likely to trigger corruption
 
-2. **Snapshot-Based Volume Cycling**
-   - Each volume deletion now includes snapshot operations
-   - Tests COW (Copy-on-Write) behavior
-   - Validates snapshot and discard interactions
-
-3. **Continuous Pool Monitoring**
-   - Pool usage (tdata/tmeta) reported at every step
-   - Track metadata growth from snapshots
-   - Monitor space reclamation from discards
+### Kernel Error Detection
+- Monitors dmesg for "unable to decrement block" errors
+- Logs to `kernel_errors.log` and `metadata_warnings.log`
 
 ## Quick Start
 
-### Basic Test (80% capacity, with snapshots)
+### Recommended: Metadata Exhaustion Test (Most Likely to Trigger)
 ```bash
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 4
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 6 -c 90 --metadata-stress -h 4
 ```
 
-### Legacy Behavior (50% capacity)
+### Quick Race Test (30 min validation)
 ```bash
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 4 -c 50
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 0.5
 ```
 
-### Custom Snapshot I/O Duration
+### Maximum Stress Test
 ```bash
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 --snapshot-io-duration 60
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 8 -c 95 --snapshot-io-duration 60 -h 8
 ```
 
-## New Volume Cycling Sequence
+### Baseline Test (No Race - for Comparison)
+```bash
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -p 4 -h 4 --no-race-mode
+```
+
+## Volume Cycling Sequence (Race Mode)
 
 ```
 For each volume selected for deletion:
@@ -43,61 +50,51 @@ For each volume selected for deletion:
 1. Take Snapshot
    └─ Monitor pool usage (metadata increase)
 
-2. Write I/O for 30s (configurable)
-   ├─ Random writes to trigger COW
-   ├─ 10% of volume size
-   └─ Monitor pool usage (data divergence)
+2. RACE MODE: Concurrent I/O + Discard
+   ├─ Start FIO (randwrite, 32 queue depth)
+   ├─ Wait 1s for I/O to start
+   ├─ Issue aggressive discards WHILE I/O RUNS:
+   │   ├─ 5 rapid iterations
+   │   ├─ 4 partial regions per volume
+   │   └─ Discard on snapshot too
+   └─ Wait for both to complete
 
-3. Discard Volume
-   ├─ Unmount if formatted
-   ├─ blkdiscard
-   └─ Monitor pool usage (space reclamation)
+3. Delete Volume (with race)
+   ├─ Background discard during delete
+   └─ lvremove volume
 
-4. Delete Volume
-   ├─ lvremove volume
-   └─ Monitor pool usage (space reclamation)
+4. Delete Snapshot
+   └─ lvremove snapshot
 
-5. Delete Snapshot
-   ├─ lvremove snapshot
-   └─ Monitor pool usage (space reclamation)
-
-6. Recreate Volume
+5. Recreate Volume
    ├─ lvcreate new volume
-   ├─ Format if needed
-   └─ Monitor pool usage (new allocation)
+   └─ Format if needed
+
+6. Check for Kernel Errors
+   └─ Monitor dmesg for "unable to decrement"
 ```
 
 ## Command-Line Parameters
 
-### New Parameter
+### Race Condition Parameters
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--snapshot-io-duration` | 30 | Seconds of I/O after snapshot |
+| `--race-mode MODE` | enabled | `enabled` or `disabled` |
+| `--no-race-mode` | - | Shortcut to disable race mode |
+| `--metadata-stress` | disabled | Use 512M metadata (stress tmeta) |
+| `--fstrim-mode` | disabled | Use fstrim on mounted filesystems |
+| `--snapshot-io-duration` | 30 | Seconds of I/O during snapshot phase |
 
-### Updated Defaults
-| Parameter | Old Default | New Default |
-|-----------|-------------|-------------|
-| `-c, --capacity-percent` | 50 | **80** |
-
-### All Parameters
-```
-Required:
-  -d, --drives DRIVES              Comma-separated drives
-
-Optional:
-  -p, --parallel-deletes NUM       Parallel deletes (default: 2)
-  -h, --max-hours HOURS            Max runtime hours (default: 0=indefinite)
-  -i, --max-iterations NUM         Max iterations (default: 0=indefinite)
-  -m, --metadata-size SIZE         Metadata size (default: 15G)
-  -c, --capacity-percent PCT       Pool capacity % (default: 80)
-  -n, --num-volumes NUM            Number of volumes (default: 16)
-  -v, --volume-mode MODE           raw or formatted (default: raw)
-  -l, --log-dir DIR                Log directory
-      --vg-name NAME               VG name (default: stress_vg)
-      --pool-name NAME             Pool name (default: stress_pool)
-      --snapshot-io-duration SEC   Snapshot I/O duration (default: 30)
-      --help                       Show help
-```
+### Basic Parameters
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-d, --drives` | required | Comma-separated drives |
+| `-p, --parallel-deletes` | 2 | Parallel deletes (1-8) |
+| `-h, --max-hours` | 0 | Max hours (0=indefinite) |
+| `-c, --capacity-percent` | 80 | Pool capacity % |
+| `-n, --num-volumes` | 16 | Number of volumes |
+| `-m, --metadata-size` | 15G | Metadata size (512M with --metadata-stress) |
+| `-v, --volume-mode` | raw | `raw` or `formatted` |
 
 ## Monitoring Pool Usage
 
@@ -127,150 +124,111 @@ The script now automatically reports pool usage at each step:
 [INFO]   Pool usage after discard: 48.1,3.7
 ```
 
-## Common Scenarios
+## Common Scenarios (Make Targets)
 
-### 1. Quick Validation (30 min)
+### Race Condition Tests (Recommended)
 ```bash
-make test-quick DRIVES=/dev/sdb,/dev/sdc
+# Quick race test (30 min)
+make test-race DRIVES=/dev/sdb,/dev/sdc
+
+# Metadata exhaustion (BEST CHANCE TO TRIGGER)
+make test-metadata-exhaustion DRIVES=/dev/sdb,/dev/sdc
+
+# Maximum stress (8h, 95% capacity)
+make test-max-stress DRIVES=/dev/sdb,/dev/sdc,/dev/sdd
 ```
 
-### 2. Standard Test (4 hours)
+### Baseline Tests (for Comparison)
 ```bash
+# Baseline without race (4h)
+make test-baseline DRIVES=/dev/sdb,/dev/sdc
+
+# Standard test (race enabled)
 make test-standard DRIVES=/dev/sdb,/dev/sdc
 ```
 
-### 3. High Stress (8 hours, 8 parallel)
+## Checking for Refcount Corruption
+
+### After Test Completes
 ```bash
-make test-stress DRIVES=/dev/sdb,/dev/sdc,/dev/sdd
+# Analyze logs with kernel error check
+make analyze-kernel
+
+# Or manually
+sudo ./analyze_thin_pool_logs.sh ./thin_pool_stress_logs --check-kernel --verbose
 ```
 
-### 4. Minimal Snapshot Impact
+### Check Log Files
 ```bash
-sudo ./thin_pool_stress_test.sh \
-  -d /dev/sdb,/dev/sdc \
-  -p 4 \
-  --snapshot-io-duration 5
+# Check kernel error log (TARGET ERROR)
+cat thin_pool_stress_logs/kernel_errors.log
+
+# Check for "unable to decrement"
+grep -i "unable to decrement" thin_pool_stress_logs/kernel_errors.log
+
+# Check metadata exhaustion
+cat thin_pool_stress_logs/metadata_warnings.log
 ```
 
-### 5. Maximum Snapshot Stress
+### Check Live Kernel Messages
 ```bash
-sudo ./thin_pool_stress_test.sh \
-  -d /dev/sdb,/dev/sdc \
-  -p 4 \
-  --snapshot-io-duration 120 \
-  -c 90
+sudo dmesg | grep -i "unable to decrement\|space map"
 ```
 
 ## Performance Expectations
 
-### Iteration Time Impact
-- **Old**: ~60-90 seconds per iteration
-- **New**: ~90-150 seconds per iteration
-  - +30s for snapshot I/O (configurable)
-  - +10-20s for snapshot operations
+### With Race Mode
+- Each iteration: ~60-90 seconds
+- Concurrent I/O + discard creates maximum stress
+- Metadata stress mode may cause slow operations near 100%
 
 ### Metadata Usage
-- **Snapshots increase metadata usage**
-- Monitor `metadata_percent` closely
-- Consider increasing metadata size for long tests:
-  ```bash
-  sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -m 20G
-  ```
+- **With `--metadata-stress`**: Watch for 95%+ usage
+- Pool may become unresponsive at 100% tmeta
+- Script alerts at 80% (warning) and 95% (critical)
 
 ### Pool Capacity
-- **80% default fills pool faster**
-- Monitor `data_percent` closely
-- Reduce if pool fills too quickly:
+- **80% default** fills pool quickly
+- **90-95%** creates maximum pressure
   ```bash
   sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -c 60
   ```
 
 ## Troubleshooting
 
-### Pool Metadata Full
-**Symptom**: Test fails with metadata errors
+### Refcount Error Not Triggered
+**Symptom**: No kernel errors after test
 
-**Solution**: Increase metadata size
+**Solutions**:
+1. Use `--metadata-stress` (512M metadata)
+2. Increase capacity to 90-95%
+3. Run longer (24+ hours)
+4. Increase parallelism to 8
+
+### Pool Metadata Full (Intentional with --metadata-stress)
+**Symptom**: Pool becomes unresponsive at 100% tmeta
+
+**Note**: This is expected with `--metadata-stress` and may trigger the target error
 ```bash
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -m 20G
+# Check metadata warnings log
+cat thin_pool_stress_logs/metadata_warnings.log
 ```
 
 ### Pool Data Full
-**Symptom**: Cannot create volumes, pool at 100%
+**Symptom**: Cannot create volumes
 
-**Solution**: Reduce capacity percentage
+**Solution**: Reduce capacity or use fewer volumes
 ```bash
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -c 60
-```
-
-### Iteration Too Slow
-**Symptom**: Each iteration takes too long
-
-**Solution**: Reduce snapshot I/O duration
-```bash
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc --snapshot-io-duration 10
-```
-
-### Snapshot Creation Fails
-**Symptom**: Errors during snapshot creation
-
-**Solution**: Check pool has enough space
-```bash
-# Check current usage
-sudo lvs -o +data_percent,metadata_percent stress_vg/stress_pool
-
-# Reduce capacity or increase pool size
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -c 50
-```
-
-## Log Analysis
-
-### Check Snapshot Operations
-```bash
-grep -i "snapshot" thin_pool_stress_logs/stress_test_*.log
-```
-
-### Monitor Pool Usage Trends
-```bash
-grep "Pool usage" thin_pool_stress_logs/stress_test_*.log
-```
-
-### Analyze Metadata Growth
-```bash
-awk -F',' '{print $1","$7}' thin_pool_stress_logs/stats_*.log
+sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -c 60 -n 12
 ```
 
 ## Best Practices
 
-1. **Start with quick test** to validate setup
-2. **Monitor metadata usage** - snapshots increase metadata
-3. **Watch pool capacity** - 80% fills faster than 50%
-4. **Adjust snapshot I/O** based on your needs
-5. **Use larger metadata** for long tests (20G instead of 15G)
-6. **Monitor in real-time** using watch commands
-
-## Migration from Old Version
-
-### Keep Old Behavior
-```bash
-# Use 50% capacity explicitly
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc -c 50
-```
-
-### Adopt New Behavior
-```bash
-# Use defaults (80% capacity, 30s snapshot I/O)
-sudo ./thin_pool_stress_test.sh -d /dev/sdb,/dev/sdc
-```
-
-### Gradual Adoption
-```bash
-# Start with 60% capacity, short snapshot I/O
-sudo ./thin_pool_stress_test.sh \
-  -d /dev/sdb,/dev/sdc \
-  -c 60 \
-  --snapshot-io-duration 15
-```
+1. **Run metadata exhaustion test first** - most likely to trigger corruption
+2. **Check kernel_errors.log after each run**
+3. **Compare race vs baseline** - confirms race conditions are needed
+4. **Monitor dmesg in real-time** during tests
+5. **Archive logs** for each test run
 
 ## Quick Commands
 
@@ -284,16 +242,38 @@ make check
 # Make scripts executable
 make permissions
 
-# Run quick test
-make test-quick DRIVES=/dev/sdb,/dev/sdc
+# Run metadata exhaustion test (RECOMMENDED)
+make test-metadata-exhaustion DRIVES=/dev/sdb,/dev/sdc
 
-# Analyze results
-make analyze
+# Run race test
+make test-race DRIVES=/dev/sdb,/dev/sdc
+
+# Analyze with kernel check
+make analyze-kernel
 
 # Clean up logs
 make clean
 
 # Emergency LVM cleanup
 make clean-lvm DRIVES=/dev/sdb,/dev/sdc
+```
+
+## Success Indicators
+
+When the target error is reproduced:
+
+```
+[ERROR] !!! KERNEL ERROR DETECTED - Check dmesg for thin pool errors !!!
+```
+
+In `kernel_errors.log`:
+```
+device-mapper: thin: space map common: unable to decrement block
+```
+
+Analysis output:
+```
+*** TARGET ERROR FOUND: 'unable to decrement block' ***
+*** REFCOUNT CORRUPTION SUCCESSFULLY REPRODUCED ***
 ```
 

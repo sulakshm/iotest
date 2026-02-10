@@ -353,7 +353,7 @@ trap cleanup EXIT INT TERM
 # Get device I/O statistics from /sys/block
 #######################################
 get_device_iostats() {
-    local device=$1
+    local device=$(readlink -f $1)
     local dev_name=$(basename "$device")
 
     # Handle device mapper devices
@@ -502,14 +502,14 @@ setup_thin_pool() {
 
     # Calculate data size (total - metadata)
     lvcreate -L "$METADATA_SIZE" -n "${POOL_NAME}_meta" "$VG_NAME"
-    lvcreate -l 100%FREE -n "${POOL_NAME}_data" "$VG_NAME"
+    lvcreate -l 90%FREE -n "${POOL_NAME}_data" "$VG_NAME"
 
     # Convert to thin pool with discard passdown and no zeroing
     lvconvert -y --type thin-pool \
         --poolmetadata "${VG_NAME}/${POOL_NAME}_meta" \
-        --thinpool "${VG_NAME}/${POOL_NAME}_data" \
         --discards passdown \
-        --zero n
+        --zero n \
+        "${VG_NAME}/${POOL_NAME}_data"
 
     # Rename to final pool name
     lvrename "${VG_NAME}/${POOL_NAME}_data" "${VG_NAME}/${POOL_NAME}"
@@ -862,6 +862,7 @@ cycle_volumes() {
         local volume_size_mb=$((volume_size / 1024 / 1024))
 
         for i in $(seq $batch_start $batch_end); do
+            lvremove -f "${VG_NAME}/thin_vol_${i}" 2>/dev/null || true
             lvcreate -V "${volume_size_mb}M" -T "${THIN_POOL}" -n "thin_vol_${i}"
             TOTAL_CREATES=$((TOTAL_CREATES + 1))
 

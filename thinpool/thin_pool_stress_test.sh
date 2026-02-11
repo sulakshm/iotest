@@ -43,6 +43,45 @@ ITERATION_COUNT=0
 TOTAL_CREATES=0
 TOTAL_DELETES=0
 TOTAL_DISCARDS=0
+TOTAL_METADATA_SNAPS=0
+
+# Batch rotation tracking (alternates between 0 and 1)
+# Batch 0 = volumes 1 to BATCH_SIZE
+# Batch 1 = volumes (BATCH_SIZE+1) to NUM_VOLUMES
+CURRENT_BATCH=0
+BATCH_SIZE=8
+
+# LVM operation serialization lock file
+LVM_LOCK_FILE="/tmp/thin_pool_stress_lvm.lock"
+
+#######################################
+# LVM operation serialization helpers
+# LVM metadata operations must be serialized - they cannot run in parallel
+# These use a directory-based lock (mkdir is atomic)
+#######################################
+lvm_lock() {
+    local max_wait=60
+    local wait_time=0
+    while ! mkdir "$LVM_LOCK_FILE" 2>/dev/null; do
+        sleep 0.1
+        wait_time=$((wait_time + 1))
+        if [[ $wait_time -ge $((max_wait * 10)) ]]; then
+            log_warning "LVM lock wait exceeded ${max_wait}s, forcing lock acquisition"
+            rmdir "$LVM_LOCK_FILE" 2>/dev/null || true
+            mkdir "$LVM_LOCK_FILE" 2>/dev/null || true
+            break
+        fi
+    done
+}
+
+lvm_unlock() {
+    rmdir "$LVM_LOCK_FILE" 2>/dev/null || true
+}
+
+# Cleanup LVM lock on script exit
+cleanup_lvm_lock() {
+    rmdir "$LVM_LOCK_FILE" 2>/dev/null || true
+}
 
 # Color codes for output
 RED='\033[0;31m'
@@ -294,7 +333,7 @@ setup_logging() {
         echo "# Parallel Deletes: $PARALLEL_DELETES"
         echo "# Volume Mode: $VOLUME_MODE"
         echo "#"
-        echo "# Iteration,Runtime(s),Creates,Deletes,Discards,Pool_Data_Used(%),Pool_Meta_Used(%)"
+        echo "# Iteration,Runtime(s),Creates,Deletes,Discards,Metadata_Snaps,Pool_Data_Used(%),Pool_Meta_Used(%)"
     } > "$STATS_LOG"
 
     # Write header to iostat log
@@ -311,7 +350,18 @@ setup_logging() {
 cleanup() {
     log_warn "Cleaning up..."
 
-    # Stop all background I/O jobs
+    # Remove LVM serialization lock
+    cleanup_lvm_lock
+
+    # Stop all I/O workloads using our PID tracking
+    if [[ -f "${LOG_DIR}/io_pids.txt" ]]; then
+        while read -r pid vol; do
+            kill "$pid" 2>/dev/null || true
+        done < "${LOG_DIR}/io_pids.txt"
+        rm -f "${LOG_DIR}/io_pids.txt"
+    fi
+
+    # Stop all background I/O jobs (fallback)
     jobs -p | xargs -r kill 2>/dev/null || true
 
     # Unmount formatted volumes
@@ -556,12 +606,16 @@ create_thin_volumes() {
 }
 
 #######################################
-# Start I/O workload on volumes
+# Start I/O workload on a range of volumes
+# Usage: start_io_workload_range <start_vol> <end_vol>
 #######################################
-start_io_workload() {
-    log_info "Starting I/O workload on $IO_VOLUMES volumes..."
+start_io_workload_range() {
+    local start_vol=$1
+    local end_vol=$2
 
-    for i in $(seq 1 $IO_VOLUMES); do
+    log_info "Starting I/O workload on volumes ${start_vol}-${end_vol}..."
+
+    for i in $(seq $start_vol $end_vol); do
         local device="/dev/${VG_NAME}/thin_vol_${i}"
         local target="$device"
 
@@ -585,20 +639,60 @@ start_io_workload() {
             --output="${LOG_DIR}/fio_vol_${i}_iter_${ITERATION_COUNT}.log" \
             >/dev/null 2>&1 &
 
-        echo $! >> "${LOG_DIR}/io_pids.txt"
+        # Store PID with volume number for selective stopping
+        echo "$! $i" >> "${LOG_DIR}/io_pids.txt"
     done
 
-    log_success "I/O workload started on $IO_VOLUMES volumes"
+    log_success "I/O workload started on volumes ${start_vol}-${end_vol}"
 }
 
 #######################################
-# Stop I/O workload
+# Start I/O workload on ALL volumes (1 to NUM_VOLUMES)
 #######################################
-stop_io_workload() {
-    log_info "Stopping I/O workload..."
+start_io_workload_all() {
+    start_io_workload_range 1 $NUM_VOLUMES
+}
+
+#######################################
+# Stop I/O workload on a range of volumes
+# Usage: stop_io_workload_range <start_vol> <end_vol>
+#######################################
+stop_io_workload_range() {
+    local start_vol=$1
+    local end_vol=$2
+
+    log_info "Stopping I/O workload on volumes ${start_vol}-${end_vol}..."
 
     if [[ -f "${LOG_DIR}/io_pids.txt" ]]; then
-        while read -r pid; do
+        local temp_file="${LOG_DIR}/io_pids_temp.txt"
+        > "$temp_file"
+
+        while read -r pid vol; do
+            if [[ $vol -ge $start_vol && $vol -le $end_vol ]]; then
+                kill "$pid" 2>/dev/null || true
+            else
+                # Keep PIDs for volumes outside the range
+                echo "$pid $vol" >> "$temp_file"
+            fi
+        done < "${LOG_DIR}/io_pids.txt"
+
+        mv "$temp_file" "${LOG_DIR}/io_pids.txt"
+    fi
+
+    # Wait for processes to terminate
+    sleep 1
+
+    log_success "I/O workload stopped on volumes ${start_vol}-${end_vol}"
+}
+
+#######################################
+# Stop ALL I/O workload
+#######################################
+stop_io_workload_all() {
+    log_info "Stopping all I/O workload..."
+
+    if [[ -f "${LOG_DIR}/io_pids.txt" ]]; then
+        while read -r pid vol; do
             kill "$pid" 2>/dev/null || true
         done < "${LOG_DIR}/io_pids.txt"
         rm -f "${LOG_DIR}/io_pids.txt"
@@ -607,37 +701,87 @@ stop_io_workload() {
     # Wait for processes to terminate
     sleep 2
 
-    log_success "I/O workload stopped"
+    log_success "All I/O workload stopped"
+}
+
+# Legacy function for compatibility
+start_io_workload() {
+    start_io_workload_all
+}
+
+stop_io_workload() {
+    stop_io_workload_all
 }
 
 #######################################
-# Delete and recreate cycle volumes
-# Sequence: snapshot -> concurrent IO+discard -> delete volume -> delete snapshot
+# Perform thin pool metadata snapshot operation
+# This is what monitoring tools do to inspect pool metadata
+# Must be serialized - these operations cannot run in parallel
+#######################################
+metadata_snapshot_operation() {
+    local pool_dm_name="${VG_NAME}-${POOL_NAME}-tpool"
+    local tmeta_device="/dev/mapper/${VG_NAME}-${POOL_NAME}_tmeta"
+
+    log_info "Performing metadata snapshot operation..."
+
+    # Reserve metadata snapshot (serialized with LVM lock)
+    lvm_lock
+    if dmsetup message "/dev/mapper/${pool_dm_name}" 0 reserve_metadata_snap 2>/dev/null; then
+        lvm_unlock
+
+        # Read metadata while reserved (this can take time, but doesn't modify LVM state)
+        thin_dump -m "$tmeta_device" > /dev/null 2>&1 || true
+
+        # Release metadata snapshot (serialized with LVM lock)
+        lvm_lock
+        dmsetup message "/dev/mapper/${pool_dm_name}" 0 release_metadata_snap 2>/dev/null || true
+        lvm_unlock
+
+        TOTAL_METADATA_SNAPS=$((TOTAL_METADATA_SNAPS + 1))
+        log_success "Metadata snapshot operation complete (total: $TOTAL_METADATA_SNAPS)"
+    else
+        lvm_unlock
+        log_warning "Failed to reserve metadata snapshot (pool may be busy)"
+    fi
+}
+
+#######################################
+# Recycle a batch of volumes
+# Sequence: snapshot -> race I/O+discard -> thin_meta snap -> thin_dump -> discard -> delete -> recreate
+# Usage: recycle_batch <start_vol> <end_vol>
 # Race mode: Runs I/O and discard SIMULTANEOUSLY to trigger refcount races
 #######################################
-cycle_volumes() {
-    local start_idx=$((IO_VOLUMES + 1))
-    local end_idx=$NUM_VOLUMES
+recycle_batch() {
+    local start_idx=$1
+    local end_idx=$2
 
-    log_info "Cycling volumes ${start_idx} to ${end_idx} (${PARALLEL_DELETES} at a time)..."
+    log_info "Recycling volumes ${start_idx} to ${end_idx}..."
     log_info "Race mode: ${RACE_MODE}"
 
-    # Process volumes in batches
+    # Process volumes in sub-batches of PARALLEL_DELETES
     for batch_start in $(seq $start_idx $PARALLEL_DELETES $end_idx); do
         local batch_end=$((batch_start + PARALLEL_DELETES - 1))
         if [[ $batch_end -gt $end_idx ]]; then
             batch_end=$end_idx
         fi
 
-        log_info "Processing batch: volumes ${batch_start} to ${batch_end}"
+        log_info "Processing sub-batch: volumes ${batch_start} to ${batch_end}"
 
-        # Step 1: Take snapshots in parallel
-        log_info "  Step 1/6: Taking snapshots..."
+        # Step 1: Take snapshots (LVM operations serialized)
+        # Remove any existing snapshot first, then create new snapshot of the volume
+        log_info "  Step 1/8: Taking snapshots..."
         local pool_stats=$(get_pool_stats)
         log_info "  Pool usage before snapshot: ${pool_stats}"
 
         for i in $(seq $batch_start $batch_end); do
+            # Remove old snapshot if exists
+            lvm_lock
+            lvremove -f "${VG_NAME}/thin_vol_${i}_snap" 2>/dev/null || true
+            lvm_unlock
+            # Create new snapshot of the volume
+            lvm_lock
             lvcreate -s -n "thin_vol_${i}_snap" "${VG_NAME}/thin_vol_${i}"
+            lvm_unlock
         done
 
         pool_stats=$(get_pool_stats)
@@ -645,7 +789,7 @@ cycle_volumes() {
 
         # Step 2: RACE MODE - Run I/O and discard CONCURRENTLY
         if [[ "$RACE_MODE" == "enabled" ]]; then
-            log_info "  Step 2/6: RACE MODE - Concurrent I/O + Discard for ${SNAPSHOT_IO_DURATION}s..."
+            log_info "  Step 2/8: RACE MODE - Concurrent I/O + Discard for ${SNAPSHOT_IO_DURATION}s..."
             pool_stats=$(get_pool_stats)
             log_info "  Pool usage before concurrent ops: ${pool_stats}"
 
@@ -731,7 +875,7 @@ cycle_volumes() {
 
         else
             # Sequential mode (original behavior)
-            log_info "  Step 2/6: Sequential I/O for ${SNAPSHOT_IO_DURATION}s..."
+            log_info "  Step 2/8: Sequential I/O for ${SNAPSHOT_IO_DURATION}s..."
             pool_stats=$(get_pool_stats)
             log_info "  Pool usage before I/O: ${pool_stats}"
 
@@ -769,7 +913,7 @@ cycle_volumes() {
             log_info "  Pool usage after I/O: ${pool_stats}"
 
             # Step 3: Sequential discard
-            log_info "  Step 3/6: Discarding volumes..."
+            log_info "  Step 3/8: Discarding volumes..."
             pool_stats=$(get_pool_stats)
             log_info "  Pool usage before discard: ${pool_stats}"
 
@@ -801,60 +945,58 @@ cycle_volumes() {
 
         # Step 4: Unmount if formatted and race mode (wasn't unmounted yet)
         if [[ "$VOLUME_MODE" == "formatted" && "$RACE_MODE" == "enabled" ]]; then
-            log_info "  Step 4/6: Unmounting volumes..."
+            log_info "  Step 4/8: Unmounting volumes..."
             for i in $(seq $batch_start $batch_end); do
                 umount "/mnt/thin_vol_${i}" 2>/dev/null || true
             done
         fi
 
-        # Step 5: Delete volumes - issue final discard right before delete for race
-        log_info "  Step 5/6: Deleting volumes (with final discard race)..."
+        # Step 5: Perform thin pool metadata snapshot operation
+        # This simulates what monitoring tools do to inspect pool metadata
+        # I/O continues on this batch and other batch during this operation
+        log_info "  Step 5/8: Thin pool metadata snapshot..."
+        metadata_snapshot_operation
+
+        # Step 6: Stop I/O on this batch ONLY - right before deletion
+        # I/O on the other batch continues throughout
+        log_info "  Step 6/8: Stopping I/O on batch ${batch_start}-${batch_end} before deletion..."
+        stop_io_workload_range $batch_start $batch_end
+
+        # Step 7: Delete volumes - discard whole volume first, then delete
+        # NOTE: LVM operations (lvremove) MUST be serialized - they cannot run in parallel
+        # blkdiscard is a block device operation but we run it before delete for each volume
+        log_info "  Step 7/8: Deleting volumes (discard then delete)..."
         pool_stats=$(get_pool_stats)
         log_info "  Pool usage before volume delete: ${pool_stats}"
 
-        local delete_pids=()
+        # For each volume: discard whole volume, then delete (serialized)
         for i in $(seq $batch_start $batch_end); do
-            (
-                local device="/dev/${VG_NAME}/thin_vol_${i}"
+            local device="/dev/${VG_NAME}/thin_vol_${i}"
 
-                if [[ "$RACE_MODE" == "enabled" ]]; then
-                    # Issue discard in background right before delete
-                    blkdiscard "$device" 2>/dev/null &
-                    local discard_pid=$!
-                    # Don't wait - delete immediately to race with discard
-                    lvremove -f "${VG_NAME}/thin_vol_${i}" 2>/dev/null || true
-                    wait $discard_pid 2>/dev/null || true
-                else
-                    lvremove -f "${VG_NAME}/thin_vol_${i}"
-                fi
-            ) &
-            delete_pids+=($!)
+            # Discard the whole volume first (block device op, no LVM lock needed)
+            blkdiscard "$device" 2>/dev/null || true
+            TOTAL_DISCARDS=$((TOTAL_DISCARDS + 1))
+
+            # Then delete the volume (LVM op, needs lock)
+            lvm_lock
+            lvremove -f "${VG_NAME}/thin_vol_${i}" 2>/dev/null || true
+            lvm_unlock
+            TOTAL_DELETES=$((TOTAL_DELETES + 1))
         done
 
-        for pid in "${delete_pids[@]}"; do
-            wait "$pid" 2>/dev/null || true
-        done
-        TOTAL_DELETES=$((TOTAL_DELETES + (batch_end - batch_start + 1)))
-
-        pool_stats=$(get_pool_stats)
-        log_info "  Pool usage after volume delete: ${pool_stats}"
-
-        # Step 6: Delete snapshots
-        log_info "  Step 6/6: Deleting snapshots..."
-        pool_stats=$(get_pool_stats)
-        log_info "  Pool usage before snapshot delete: ${pool_stats}"
-
+        # Delete snapshots (LVM operations serialized)
+        log_info "  Deleting snapshots..."
         for i in $(seq $batch_start $batch_end); do
+            lvm_lock
             lvremove -f "${VG_NAME}/thin_vol_${i}_snap" 2>/dev/null || true
+            lvm_unlock
         done
 
         pool_stats=$(get_pool_stats)
-        log_info "  Pool usage after snapshot delete: ${pool_stats}"
+        log_info "  Pool usage after delete: ${pool_stats}"
 
-        # Recreate volumes
+        # Recreate volumes (LVM operations serialized)
         log_info "  Recreating volumes..."
-        pool_stats=$(get_pool_stats)
-        log_info "  Pool usage before recreate: ${pool_stats}"
 
         local pool_size=$(lvs --noheadings --units b -o lv_size "${THIN_POOL}" | tr -d ' B')
         local total_provisioned=$((pool_size * POOL_CAPACITY_PERCENT / 100))
@@ -862,11 +1004,12 @@ cycle_volumes() {
         local volume_size_mb=$((volume_size / 1024 / 1024))
 
         for i in $(seq $batch_start $batch_end); do
-            lvremove -f "${VG_NAME}/thin_vol_${i}" 2>/dev/null || true
+            lvm_lock
             lvcreate -V "${volume_size_mb}M" -T "${THIN_POOL}" -n "thin_vol_${i}"
+            lvm_unlock
             TOTAL_CREATES=$((TOTAL_CREATES + 1))
 
-            # Format if needed
+            # Format if needed (not an LVM operation, can run after unlock)
             if [[ "$VOLUME_MODE" == "formatted" ]]; then
                 mkfs.ext4 -F "/dev/${VG_NAME}/thin_vol_${i}" >/dev/null 2>&1
                 mount "/dev/${VG_NAME}/thin_vol_${i}" "/mnt/thin_vol_${i}"
@@ -875,9 +1018,13 @@ cycle_volumes() {
 
         pool_stats=$(get_pool_stats)
         log_info "  Pool usage after recreate: ${pool_stats}"
+
+        # Step 8: Restart I/O on the recreated volumes
+        log_info "  Step 8/8: Restarting I/O on batch ${batch_start}-${batch_end}..."
+        start_io_workload_range $batch_start $batch_end
     done
 
-    log_success "Volume cycling complete"
+    log_success "Batch recycling complete for volumes ${start_idx}-${end_idx}"
 }
 
 #######################################
@@ -943,6 +1090,7 @@ print_iteration_summary() {
     log_info "Total Creates: $TOTAL_CREATES"
     log_info "Total Deletes: $TOTAL_DELETES"
     log_info "Total Discards: $TOTAL_DISCARDS"
+    log_info "Total Metadata Snaps: $TOTAL_METADATA_SNAPS"
     log_info "Pool Data Used: ${data_pct}%"
     log_info "Pool Metadata Used: ${meta_pct}%"
 
@@ -981,32 +1129,56 @@ print_iteration_summary() {
 }
 
 #######################################
-# Run single iteration
+# Run single iteration with batch rotation
+# All 16 volumes have I/O running
+# Alternate between batch A (1-8) and batch B (9-16) for recycling
+# I/O stops on batch only before deletion, other batch continues
 #######################################
 run_iteration() {
     ITERATION_COUNT=$((ITERATION_COUNT + 1))
     local current_time=$(date +%s)
     local runtime=$((current_time - START_TIME))
 
+    # Determine which batch to recycle this iteration (alternates 0, 1, 0, 1, ...)
+    # Batch 0 = volumes 1 to BATCH_SIZE (1-8)
+    # Batch 1 = volumes (BATCH_SIZE+1) to NUM_VOLUMES (9-16)
+    local batch_to_recycle=$((ITERATION_COUNT % 2))
+    local recycle_start recycle_end
+
+    if [[ $batch_to_recycle -eq 1 ]]; then
+        # Odd iterations: recycle batch A (1-8)
+        recycle_start=1
+        recycle_end=$BATCH_SIZE
+    else
+        # Even iterations: recycle batch B (9-16)
+        recycle_start=$((BATCH_SIZE + 1))
+        recycle_end=$NUM_VOLUMES
+    fi
+
     log_info "Starting iteration $ITERATION_COUNT (runtime: ${runtime}s)"
+    log_info "Recycling batch: volumes ${recycle_start}-${recycle_end}"
+    log_info "I/O continues on: all volumes until deletion"
 
     # Capture I/O stats before
     capture_iostats "before" "$ITERATION_COUNT"
 
-    # Start I/O workload
-    start_io_workload
+    # For the first iteration, start I/O on ALL volumes (1-16)
+    # For subsequent iterations, I/O should already be running on all volumes
+    # (previous iteration restarted I/O on recycled batch)
+    if [[ $ITERATION_COUNT -eq 1 ]]; then
+        log_info "First iteration: Starting I/O on ALL volumes (1-${NUM_VOLUMES})..."
+        start_io_workload_all
+        # Let I/O run for a bit before recycling
+        sleep 5
+    fi
 
-    # Let I/O run for a bit before cycling
-    sleep 5
+    # Recycle the selected batch
+    # I/O continues on all volumes until right before deletion (handled inside recycle_batch)
+    # After deletion+recreation, I/O is restarted on the recycled batch (handled inside recycle_batch)
+    recycle_batch $recycle_start $recycle_end
 
-    # Cycle volumes (delete and recreate)
-    cycle_volumes
-
-    # Let I/O continue after cycling
-    sleep 5
-
-    # Stop I/O workload
-    stop_io_workload
+    # Let I/O stabilize after batch recycling
+    sleep 3
 
     # Capture I/O stats after
     capture_iostats "after" "$ITERATION_COUNT"
@@ -1025,7 +1197,7 @@ run_iteration() {
     check_metadata_exhaustion
 
     # Log to stats file
-    echo "${ITERATION_COUNT},${runtime},${TOTAL_CREATES},${TOTAL_DELETES},${TOTAL_DISCARDS},${data_pct},${meta_pct}" >> "$STATS_LOG"
+    echo "${ITERATION_COUNT},${runtime},${TOTAL_CREATES},${TOTAL_DELETES},${TOTAL_DISCARDS},${TOTAL_METADATA_SNAPS},${data_pct},${meta_pct}" >> "$STATS_LOG"
 
     # Print summary
     print_iteration_summary "$ITERATION_COUNT" "$runtime" "$pool_stats"
@@ -1120,6 +1292,7 @@ main() {
     log_success "Total Creates: $TOTAL_CREATES"
     log_success "Total Deletes: $TOTAL_DELETES"
     log_success "Total Discards: $TOTAL_DISCARDS"
+    log_success "Total Metadata Snaps: $TOTAL_METADATA_SNAPS"
     log_success "Logs saved to: $LOG_DIR"
     log_success "=========================================="
 }
